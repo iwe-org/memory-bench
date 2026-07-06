@@ -1,0 +1,17 @@
+maxTokens: 1500
+maxDepth: 2
+sections:
+  - header: { maxTokens: 8 }
+    maxContains: 1
+    sections:
+      - header: { pattern: '(?i)timeline' }
+        minContains: 0
+        maxTokens: 900
+        description: the timeline is an index of dated one-line entries
+        blocks:
+          - type: bullet-list
+            items: { maxTokens: 100 }
+        additionalBlocks: false
+    additionalSections:
+      maxTokens: 400
+additionalSections: false

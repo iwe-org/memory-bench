@@ -1,0 +1,7 @@
+maxTokens: 600
+maxDepth: 1
+sections:
+  - header: { pattern: '\(\d{1,2} [A-Z][a-z]+ \d{4}\)$', maxTokens: 30 }
+    maxContains: 1
+    description: one title naming the session topics and ending with the date
+additionalSections: false
