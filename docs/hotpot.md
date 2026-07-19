@@ -38,11 +38,42 @@ article (`# Title` + paragraph text), key slugified from the title. Both arms re
 this same directory; ingestion is question-blind by construction (the corpus is
 the dataset's own distractor design, assembled without model involvement, $0).
 
-Tier 1 (this document) ingests **no links**, so `--expand-references` and
-`--expand-included-by` have nothing to walk: the `ctx` arm measures the BM25
-floor of the one-shot mechanism. Tier 2 — a cheap agentic linking pass that adds
-graph edges between related articles — is the follow-up experiment that measures
-what the graph itself buys; it must remain question-blind like LOCOMO curation.
+Three corpus tiers isolate what each layer of graph structure buys, all
+question-blind:
+
+1. **Tier 1, `corpus/`** — no links; the `ctx` arm measures the BM25 floor of
+   the one-shot mechanism (reference expansion has nothing to walk).
+2. **Tier 2, `corpus-linked/`** (`ingest --linked`) — mechanical title-mention
+   linking: each page's first bounded occurrence of another article's title
+   becomes a link, reconstructing Wikipedia's own hyperlink structure by
+   string matching. Parenthetical-stripped variants ("Eluvium" for "Eluvium
+   (musician)") are added only when corpus-rare (bounded occurrences in ≤ 8
+   other pages) — common words like "Office" would otherwise false-link
+   dozens of pages and pollute inbound expansion. Deterministic, $0, no model
+   involvement. Select with `answer --corpus corpus-linked`.
+3. **Tier 3, `corpus-agentic/`** (`enrich`) — an agentic pass on top of
+   tier 2: one one-shot model call per page (haiku by default) sees the page
+   plus BM25-nearest candidate articles and proposes links string matching
+   cannot see (descriptive mentions — "defending champions", "the previous
+   year's final"). The harness validates and applies proposals mechanically:
+   spans must exist verbatim outside existing links, keys must exist, the
+   agent never rewrites content — its only reachable surface is link
+   topology, so curation cannot inject facts. Resumable via
+   `enrich-<target>.jsonl`. Select with `answer --corpus corpus-agentic`.
+
+The hotpot dossier expands all reference edges — outbound
+(`--expand-references`) and inbound (`--expand-referenced-by`) plus
+`--expand-included-by` — so bridge questions whose second-hop article *links
+to* the BM25-found seed are pulled in. Both expansion directions are no-ops on
+the unlinked tier-1 corpus, keeping the corpus the only variable between tiers.
+`--dossier-limit` (default 5) sets the BM25 seed count. `--anchors` adds
+entity-anchored seeding: distinctive spans mechanically extracted from the
+question text (quoted strings, stopword-trimmed capitalized runs,
+slash/camel-case singles) each get their own BM25 sub-query (limit 2, 4k-token
+slice, expansions on) ahead of the whole-question query — long questions can
+no longer drown a rare entity term, and comparison questions get both entity
+articles as seeds by construction. All three knobs are recorded and guarded in
+the run's `meta.json`.
 
 ## Arms
 

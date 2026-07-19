@@ -108,31 +108,136 @@ pub fn slug(title: &str) -> String {
     }
 }
 
-fn render_article(title: &str, sentences: &[String]) -> String {
+fn article_text(sentences: &[String]) -> String {
     let joined = sentences.join(" ");
-    let text: Vec<&str> = joined.split_whitespace().collect();
-    format!("# {}\n\n{}\n", title, text.join(" "))
+    let words: Vec<&str> = joined.split_whitespace().collect();
+    words.join(" ")
 }
 
-pub fn corpus_pages(items: &[Item]) -> BTreeMap<String, String> {
+fn render_article(title: &str, body: &str) -> String {
+    format!("# {title}\n\n{body}\n")
+}
+
+fn article_map(items: &[Item]) -> BTreeMap<&str, &[String]> {
     let mut articles: BTreeMap<&str, &[String]> = BTreeMap::new();
     for item in items {
         for (title, sentences) in &item.context {
             articles.entry(title.as_str()).or_insert(sentences);
         }
     }
-    let mut pages = BTreeMap::new();
-    for (title, sentences) in articles {
+    articles
+}
+
+fn assign_keys<'a>(articles: &BTreeMap<&'a str, &'a [String]>) -> Vec<(&'a str, String)> {
+    let mut used = BTreeSet::new();
+    let mut keys = Vec::new();
+    for title in articles.keys() {
         let base = slug(title);
         let mut key = base.clone();
         let mut n = 2;
-        while pages.contains_key(&key) {
+        while used.contains(&key) {
             key = format!("{base}-{n}");
             n += 1;
         }
-        pages.insert(key, render_article(title, sentences));
+        used.insert(key.clone());
+        keys.push((*title, key));
     }
-    pages
+    keys
+}
+
+const STRIPPED_VARIANT_MAX_PAGES: usize = 8;
+
+fn link_targets(keys: &[(&str, String)], bodies: &BTreeMap<&str, String>) -> BTreeMap<String, String> {
+    let mut targets = BTreeMap::new();
+    for (title, key) in keys {
+        targets.insert((*title).to_string(), key.clone());
+    }
+    for (title, key) in keys {
+        let stripped = title.split(" (").next().unwrap_or_default().trim();
+        if stripped.len() < 2 || stripped == *title || targets.contains_key(stripped) {
+            continue;
+        }
+        let pages_mentioning = bodies
+            .iter()
+            .filter(|(other, body)| *other != title && find_bounded(body, stripped).is_some())
+            .count();
+        if pages_mentioning <= STRIPPED_VARIANT_MAX_PAGES {
+            targets.insert(stripped.to_string(), key.clone());
+        }
+    }
+    targets
+}
+
+fn find_bounded(text: &str, name: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(name) {
+        let start = from + pos;
+        let end = start + name.len();
+        let before_ok = !text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_alphanumeric);
+        let after_ok = !text[end..].chars().next().is_some_and(char::is_alphanumeric);
+        if before_ok && after_ok {
+            return Some(start);
+        }
+        from = end;
+    }
+    None
+}
+
+fn link_text(text: &str, own_key: &str, targets: &BTreeMap<String, String>) -> String {
+    let mut matches: Vec<(usize, usize, &str)> = Vec::new();
+    for (name, key) in targets {
+        if let Some(start) = find_bounded(text, name) {
+            matches.push((start, start + name.len(), key));
+        }
+    }
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (start, end, key) in matches {
+        if start < cursor {
+            continue;
+        }
+        out.push_str(&text[cursor..start]);
+        if key == own_key {
+            out.push_str(&text[start..end]);
+        } else {
+            out.push('[');
+            out.push_str(&text[start..end]);
+            out.push_str("](");
+            out.push_str(key);
+            out.push(')');
+        }
+        cursor = end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+pub fn corpus_pages(items: &[Item]) -> BTreeMap<String, String> {
+    let articles = article_map(items);
+    assign_keys(&articles)
+        .into_iter()
+        .map(|(title, key)| (key, render_article(title, &article_text(articles[title]))))
+        .collect()
+}
+
+pub fn corpus_pages_linked(items: &[Item]) -> BTreeMap<String, String> {
+    let articles = article_map(items);
+    let keys = assign_keys(&articles);
+    let bodies: BTreeMap<&str, String> = articles
+        .iter()
+        .map(|(title, sentences)| (*title, article_text(sentences)))
+        .collect();
+    let targets = link_targets(&keys, &bodies);
+    keys.iter()
+        .map(|(title, key)| {
+            let body = link_text(&bodies[title], key, &targets);
+            (key.clone(), render_article(title, &body))
+        })
+        .collect()
 }
 
 pub struct IngestConfig {
@@ -140,6 +245,7 @@ pub struct IngestConfig {
     pub workspaces: PathBuf,
     pub dev_questions: usize,
     pub test_questions: usize,
+    pub linked: bool,
     pub force: bool,
 }
 
@@ -164,6 +270,20 @@ pub fn read_questions(path: &Path) -> Result<Vec<Question>> {
     Ok(serde_json::from_str(&text)?)
 }
 
+fn freeze_questions(path: &Path, items: &[Item], force: bool) -> Result<()> {
+    if path.exists() && !force {
+        let existing: Vec<String> = read_questions(path)?.into_iter().map(|q| q.id).collect();
+        let sampled: Vec<&str> = items.iter().map(|i| i.id.as_str()).collect();
+        anyhow::ensure!(
+            existing == sampled,
+            "frozen sample in {} does not match the current sampling parameters; pass --force to re-sample",
+            path.display()
+        );
+        return Ok(());
+    }
+    write_questions(path, items)
+}
+
 pub fn ingest(config: &IngestConfig) -> Result<()> {
     let items = sample(load(&config.data)?, SAMPLE_SEED);
     let total = config.dev_questions + config.test_questions;
@@ -173,28 +293,32 @@ pub fn ingest(config: &IngestConfig) -> Result<()> {
         items.len()
     );
     let root = config.workspaces.join("hotpot");
-    let dev_path = root.join("questions-dev.json");
-    let test_path = root.join("questions-test.json");
-    if config.force {
-        if root.exists() {
-            std::fs::remove_dir_all(&root)?;
-        }
-    } else {
-        anyhow::ensure!(
-            !dev_path.exists() && !test_path.exists(),
-            "frozen question files exist in {}; pass --force to re-sample",
-            root.display()
-        );
+    std::fs::create_dir_all(&root)?;
+    freeze_questions(
+        &root.join("questions-dev.json"),
+        &items[..config.dev_questions],
+        config.force,
+    )?;
+    freeze_questions(
+        &root.join("questions-test.json"),
+        &items[config.dev_questions..total],
+        config.force,
+    )?;
+    let store = if config.linked { "corpus-linked" } else { "corpus" };
+    let corpus = root.join(store);
+    if config.force && corpus.exists() {
+        std::fs::remove_dir_all(&corpus)?;
     }
-    let corpus = root.join("corpus");
     std::fs::create_dir_all(&corpus)?;
-    let pages = corpus_pages(&items[..total]);
+    let pages = if config.linked {
+        corpus_pages_linked(&items[..total])
+    } else {
+        corpus_pages(&items[..total])
+    };
     for (key, content) in &pages {
         std::fs::write(corpus.join(format!("{key}.md")), content)?;
     }
     prepare::init_iwe_bare(&corpus)?;
-    write_questions(&dev_path, &items[..config.dev_questions])?;
-    write_questions(&test_path, &items[config.dev_questions..total])?;
     println!(
         "hotpot: {} dev + {} test questions, {} articles in {}",
         config.dev_questions,
@@ -366,14 +490,112 @@ mod tests {
     #[test]
     fn renders_article_with_normalized_spacing() {
         assert_eq!(
-            render_article(
-                "Alpha Corp",
-                &[
-                    "Alpha Corp is a company.".to_string(),
-                    " It was founded in 1990.".to_string(),
-                ],
+            article_text(&[
+                "Alpha Corp is a company.".to_string(),
+                " It was founded in 1990.".to_string(),
+            ]),
+            "Alpha Corp is a company. It was founded in 1990."
+        );
+    }
+
+    #[test]
+    fn links_first_bounded_occurrence() {
+        let targets = BTreeMap::from([
+            ("Alpha Corp".to_string(), "alpha-corp".to_string()),
+            ("Beta".to_string(), "beta".to_string()),
+        ]);
+        assert_eq!(
+            link_text(
+                "Betamax preceded Beta and Beta again, then Alpha Corp.",
+                "gamma",
+                &targets,
             ),
-            "# Alpha Corp\n\nAlpha Corp is a company. It was founded in 1990.\n"
+            "Betamax preceded [Beta](beta) and Beta again, then [Alpha Corp](alpha-corp)."
+        );
+    }
+
+    #[test]
+    fn linking_skips_own_page_and_prefers_longer_match() {
+        let targets = BTreeMap::from([
+            ("Alpha".to_string(), "alpha".to_string()),
+            ("Alpha Corp".to_string(), "alpha-corp".to_string()),
+        ]);
+        assert_eq!(
+            link_text("Alpha Corp grew fast.", "alpha-corp", &targets),
+            "Alpha Corp grew fast."
+        );
+        assert_eq!(
+            link_text("Alpha Corp grew fast.", "other", &targets),
+            "[Alpha Corp](alpha-corp) grew fast."
+        );
+    }
+
+    #[test]
+    fn link_targets_keep_rare_stripped_variants_and_drop_common_ones() {
+        let keys = vec![
+            ("Building (film)", "building-film".to_string()),
+            ("Quexal (musician)", "quexal-musician".to_string()),
+            ("Gamma", "gamma".to_string()),
+        ];
+        let mut bodies: BTreeMap<&str, String> = BTreeMap::from([
+            ("Building (film)", "Building is a film.".to_string()),
+            (
+                "Quexal (musician)",
+                "Quexal is a musician.".to_string(),
+            ),
+            ("Gamma", "Gamma mentions Quexal once.".to_string()),
+        ]);
+        let fillers: Vec<String> = (0..9).map(|n| format!("Filler {n}")).collect();
+        for filler in &fillers {
+            bodies.insert(filler, "The Building here is tall.".to_string());
+        }
+        assert_eq!(
+            link_targets(&keys, &bodies),
+            BTreeMap::from([
+                ("Building (film)".to_string(), "building-film".to_string()),
+                (
+                    "Quexal (musician)".to_string(),
+                    "quexal-musician".to_string()
+                ),
+                ("Quexal".to_string(), "quexal-musician".to_string()),
+                ("Gamma".to_string(), "gamma".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn linked_corpus_pages_cross_reference() {
+        let items = vec![Item {
+            id: "q1".to_string(),
+            question: String::new(),
+            answer: String::new(),
+            qtype: String::new(),
+            context: vec![
+                (
+                    "Alpha Corp".to_string(),
+                    vec!["Alpha Corp was founded by Jane Roe.".to_string()],
+                ),
+                (
+                    "Jane Roe".to_string(),
+                    vec!["Jane Roe founded Alpha Corp in 1990.".to_string()],
+                ),
+            ],
+            supporting: Vec::new(),
+        }];
+        assert_eq!(
+            corpus_pages_linked(&items),
+            BTreeMap::from([
+                (
+                    "alpha-corp".to_string(),
+                    "# Alpha Corp\n\nAlpha Corp was founded by [Jane Roe](jane-roe).\n"
+                        .to_string(),
+                ),
+                (
+                    "jane-roe".to_string(),
+                    "# Jane Roe\n\nJane Roe founded [Alpha Corp](alpha-corp) in 1990.\n"
+                        .to_string(),
+                ),
+            ])
         );
     }
 }

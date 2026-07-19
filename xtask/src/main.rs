@@ -3,6 +3,7 @@ mod claude;
 mod clean;
 mod curate;
 mod doctor;
+mod enrich;
 mod hotpot;
 mod judge;
 mod locomo;
@@ -20,6 +21,7 @@ use clap::{Parser, Subcommand};
 
 use answer::{AnswerConfig, Arm, Dataset, Split};
 use curate::CurateConfig;
+use enrich::EnrichConfig;
 use hotpot::IngestConfig;
 use judge::JudgeConfig;
 
@@ -55,7 +57,31 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         test_questions: usize,
         #[arg(long)]
+        linked: bool,
+        #[arg(long)]
         force: bool,
+    },
+    Enrich {
+        #[arg(long, default_value = "workspaces")]
+        workspaces: PathBuf,
+        #[arg(long, default_value = "corpus-linked")]
+        source: String,
+        #[arg(long, default_value = "corpus-agentic")]
+        target: String,
+        #[arg(long, default_value = "claude-haiku-4-5-20251001")]
+        model: String,
+        #[arg(long, default_value_t = 15)]
+        candidates: usize,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        replay: Option<PathBuf>,
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+        #[arg(long, default_value_t = 0.05)]
+        max_budget_usd: f64,
+        #[arg(long, default_value_t = 120)]
+        timeout_secs: u64,
     },
     Prepare {
         #[arg(long, default_value = "data/locomo10.json")]
@@ -104,6 +130,12 @@ enum Command {
         split: Option<Split>,
         #[arg(long)]
         limit: Option<usize>,
+        #[arg(long, default_value_t = answer::DOSSIER_LIMIT)]
+        dossier_limit: usize,
+        #[arg(long, default_value = "corpus")]
+        corpus: String,
+        #[arg(long)]
+        anchors: bool,
         #[arg(long, default_value_t = 2)]
         workers: usize,
         #[arg(long, default_value_t = 0.5)]
@@ -192,13 +224,38 @@ fn main() -> Result<()> {
             workspaces,
             dev_questions,
             test_questions,
+            linked,
             force,
         } => hotpot::ingest(&IngestConfig {
             data,
             workspaces,
             dev_questions,
             test_questions,
+            linked,
             force,
+        }),
+        Command::Enrich {
+            workspaces,
+            source,
+            target,
+            model,
+            candidates,
+            limit,
+            replay,
+            workers,
+            max_budget_usd,
+            timeout_secs,
+        } => enrich::run(&EnrichConfig {
+            workspaces,
+            source,
+            target,
+            model,
+            candidates,
+            limit,
+            replay,
+            workers,
+            max_budget_usd,
+            timeout_secs,
         }),
         Command::Prepare {
             data,
@@ -235,6 +292,9 @@ fn main() -> Result<()> {
             conversations,
             split,
             limit,
+            dossier_limit,
+            corpus,
+            anchors,
             workers,
             max_budget_usd,
             timeout_secs,
@@ -252,6 +312,9 @@ fn main() -> Result<()> {
                     .or_else(|| parse_filter(&conversations)),
                 split,
                 limit,
+                dossier_limit,
+                corpus,
+                anchors,
                 workers,
                 max_budget_usd,
                 timeout_secs,

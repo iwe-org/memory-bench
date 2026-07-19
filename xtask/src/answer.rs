@@ -186,6 +186,9 @@ pub struct AnswerConfig {
     pub conversation_filter: Option<BTreeSet<String>>,
     pub split: Option<Split>,
     pub limit: Option<usize>,
+    pub dossier_limit: usize,
+    pub corpus: String,
+    pub anchors: bool,
     pub workers: usize,
     pub max_budget_usd: f64,
     pub timeout_secs: u64,
@@ -200,7 +203,10 @@ fn build_prompt(config: &AnswerConfig, conversation: &Conversation, qa: &Qa) -> 
                 .workspaces
                 .join("curated")
                 .join(&conversation.sample_id);
-            CONTEXT_TEMPLATE.replace("{context}", &render_dossier(&workspace, &qa.question)?)
+            CONTEXT_TEMPLATE.replace(
+                "{context}",
+                &render_dossier(&workspace, &qa.question, config.dossier_limit, false)?,
+            )
         }
         _ => ANSWER_TEMPLATE.to_string(),
     };
@@ -210,28 +216,133 @@ fn build_prompt(config: &AnswerConfig, conversation: &Conversation, qa: &Qa) -> 
         .replace("{question}", &qa.question))
 }
 
-const DOSSIER_LIMIT: usize = 5;
+pub const DOSSIER_LIMIT: usize = 5;
 const DOSSIER_MAX_TOKENS: usize = 12000;
 const DOSSIER_MAX_CHARS: usize = 60000;
+const ANCHOR_LIMIT: usize = 2;
+const ANCHOR_MAX_TOKENS: usize = 4000;
+const MAX_ANCHORS: usize = 4;
+const MAX_ANCHOR_WORDS: usize = 6;
 
-fn render_dossier(workspace: &Path, question: &str) -> Result<String> {
+const ANCHOR_STOPWORDS: &[&str] = &[
+    "the", "what", "which", "who", "whom", "whose", "when", "where", "why", "how", "was", "were",
+    "is", "are", "a", "an", "of", "in", "on", "and", "or", "to", "for", "with", "by", "from",
+    "as", "at", "it", "its", "his", "her", "their", "this", "that", "these", "those", "not",
+    "no", "both", "did", "does", "do", "has", "have", "had", "name", "named", "into", "made",
+];
+
+fn is_stopword(word: &str) -> bool {
+    let bare: String = word
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    ANCHOR_STOPWORDS.contains(&bare.as_str())
+}
+
+fn is_anchor_word(word: &str) -> bool {
+    let mut chars = word.chars().filter(|c| c.is_alphanumeric());
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    first.is_uppercase() || first.is_numeric()
+}
+
+fn is_distinctive_single(word: &str) -> bool {
+    word.contains('/')
+        || word.chars().any(char::is_numeric)
+        || word
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .skip(1)
+            .any(char::is_uppercase)
+}
+
+pub fn extract_anchors(question: &str) -> Vec<String> {
+    let mut anchors = Vec::new();
+    let mut push = |anchor: String| {
+        if !anchors.contains(&anchor) && anchors.len() < MAX_ANCHORS {
+            anchors.push(anchor);
+        }
+    };
+    let mut rest = question;
+    while let Some(open) = rest.find('"') {
+        let Some(close) = rest[open + 1..].find('"') else {
+            break;
+        };
+        let span = rest[open + 1..open + 1 + close].trim();
+        if span.len() >= 3 {
+            push(span.to_string());
+        }
+        rest = &rest[open + 1 + close + 1..];
+    }
+    let words: Vec<&str> = question.split_whitespace().collect();
+    let mut run: Vec<&str> = Vec::new();
+    let mut flush = |run: &mut Vec<&str>, push: &mut dyn FnMut(String)| {
+        let trimmed: Vec<&str> = run
+            .iter()
+            .copied()
+            .skip_while(|w| is_stopword(w))
+            .collect();
+        let trimmed: Vec<&str> = trimmed
+            .iter()
+            .copied()
+            .rev()
+            .skip_while(|w| is_stopword(w))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let keep = trimmed.len() >= 2
+            || (trimmed.len() == 1 && is_distinctive_single(trimmed[0]));
+        if keep && trimmed.len() <= MAX_ANCHOR_WORDS {
+            let text: String = trimmed
+                .join(" ")
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != '/')
+                .to_string();
+            if text.len() >= 2 {
+                push(text);
+            }
+        }
+        run.clear();
+    };
+    for word in words {
+        if is_anchor_word(word) {
+            run.push(word);
+        } else {
+            flush(&mut run, &mut push);
+        }
+    }
+    flush(&mut run, &mut push);
+    anchors
+}
+
+fn retrieve_docs(
+    workspace: &Path,
+    query: &str,
+    limit: usize,
+    max_tokens: usize,
+    inbound: bool,
+) -> Result<Vec<(String, String)>> {
     let iwe = prepare::resolve_iwe()?;
-    let output = std::process::Command::new(&iwe)
-        .args([
-            "retrieve",
-            "--lexical",
-            question,
-            "--limit",
-            &DOSSIER_LIMIT.to_string(),
-            "--expand-references",
-            "--expand-included-by",
-            "--max-tokens",
-            &DOSSIER_MAX_TOKENS.to_string(),
-            "-f",
-            "json",
-        ])
-        .current_dir(workspace)
-        .output()?;
+    let mut command = std::process::Command::new(&iwe);
+    command.args([
+        "retrieve",
+        "--lexical",
+        query,
+        "--limit",
+        &limit.to_string(),
+        "--expand-references",
+        "--expand-included-by",
+        "--max-tokens",
+        &max_tokens.to_string(),
+        "-f",
+        "json",
+    ]);
+    if inbound {
+        command.arg("--expand-referenced-by");
+    }
+    let output = command.current_dir(workspace).output()?;
     anyhow::ensure!(
         output.status.success(),
         "iwe retrieve failed in {}: {}",
@@ -239,17 +350,68 @@ fn render_dossier(workspace: &Path, question: &str) -> Result<String> {
         String::from_utf8_lossy(&output.stderr)
     );
     let docs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)?;
+    Ok(docs
+        .iter()
+        .map(|doc| {
+            (
+                doc["key"].as_str().unwrap_or_default().to_string(),
+                doc["content"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect())
+}
+
+fn join_docs(docs: Vec<(String, String)>) -> Result<String> {
+    let mut seen = BTreeSet::new();
     let mut context = String::new();
-    for doc in &docs {
-        let body = doc["content"].as_str().unwrap_or_default();
+    for (key, body) in docs {
+        if !seen.insert(key) {
+            continue;
+        }
         if context.len() + body.len() > DOSSIER_MAX_CHARS {
             break;
         }
-        context.push_str(body);
+        context.push_str(&body);
         context.push_str("\n\n---\n\n");
     }
     anyhow::ensure!(!context.is_empty(), "empty dossier for question");
     Ok(context)
+}
+
+fn render_dossier(workspace: &Path, question: &str, limit: usize, inbound: bool) -> Result<String> {
+    join_docs(retrieve_docs(
+        workspace,
+        question,
+        limit,
+        DOSSIER_MAX_TOKENS,
+        inbound,
+    )?)
+}
+
+fn render_dossier_anchored(
+    workspace: &Path,
+    question: &str,
+    limit: usize,
+    inbound: bool,
+) -> Result<String> {
+    let mut docs = Vec::new();
+    for anchor in extract_anchors(question) {
+        docs.extend(retrieve_docs(
+            workspace,
+            &anchor,
+            ANCHOR_LIMIT,
+            ANCHOR_MAX_TOKENS,
+            inbound,
+        )?);
+    }
+    docs.extend(retrieve_docs(
+        workspace,
+        question,
+        limit,
+        DOSSIER_MAX_TOKENS,
+        inbound,
+    )?);
+    join_docs(docs)
 }
 
 fn bench_rev() -> Result<String> {
@@ -274,11 +436,19 @@ fn write_meta(config: &AnswerConfig) -> Result<()> {
         let existing: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
         let existing_dataset = existing["dataset"].as_str().unwrap_or("locomo");
+        let existing_dossier_limit = existing["dossier_limit"]
+            .as_u64()
+            .unwrap_or(DOSSIER_LIMIT as u64) as usize;
+        let existing_corpus = existing["corpus"].as_str().unwrap_or("corpus");
+        let existing_anchors = existing["anchors"].as_bool().unwrap_or(false);
         anyhow::ensure!(
             existing["arm"] == config.arm.name()
                 && existing["model"] == config.model.as_str()
-                && existing_dataset == config.dataset.name(),
-            "run dir {} was started with dataset={existing_dataset} arm={} model={}; use a fresh --run dir",
+                && existing_dataset == config.dataset.name()
+                && existing_dossier_limit == config.dossier_limit
+                && existing_corpus == config.corpus
+                && existing_anchors == config.anchors,
+            "run dir {} was started with dataset={existing_dataset} arm={} model={} dossier_limit={existing_dossier_limit} corpus={existing_corpus}; use a fresh --run dir",
             config.run.display(),
             existing["arm"],
             existing["model"],
@@ -291,6 +461,9 @@ fn write_meta(config: &AnswerConfig) -> Result<()> {
         "model": config.model,
         "categories": config.categories,
         "limit": config.limit,
+        "dossier_limit": config.dossier_limit,
+        "corpus": config.corpus,
+        "anchors": config.anchors,
         "max_budget_usd": config.max_budget_usd,
         "claude_version": claude::claude_version()?,
         "bench_rev": bench_rev()?,
@@ -369,8 +542,14 @@ pub fn run(config: &AnswerConfig) -> Result<()> {
 
 fn hotpot_prompt(config: &AnswerConfig, corpus: &Path, question: &hotpot::Question) -> Result<String> {
     let template = match config.arm {
-        Arm::Ctx => HOTPOT_CONTEXT_TEMPLATE
-            .replace("{context}", &render_dossier(corpus, &question.question)?),
+        Arm::Ctx => {
+            let dossier = if config.anchors {
+                render_dossier_anchored(corpus, &question.question, config.dossier_limit, true)?
+            } else {
+                render_dossier(corpus, &question.question, config.dossier_limit, true)?
+            };
+            HOTPOT_CONTEXT_TEMPLATE.replace("{context}", &dossier)
+        }
         _ => HOTPOT_ANSWER_TEMPLATE.to_string(),
     };
     Ok(template.replace("{question}", &question.question))
@@ -431,7 +610,7 @@ fn run_hotpot(config: &AnswerConfig) -> Result<()> {
             .open(&answers_path)?,
     );
     let root = config.workspaces.join("hotpot");
-    let corpus = root.join("corpus");
+    let corpus = root.join(&config.corpus);
     anyhow::ensure!(
         corpus.exists(),
         "corpus {} missing; run `cargo xtask ingest` first",
@@ -812,6 +991,42 @@ mod tests {
         assert_eq!(Arm::CuratedFs.name(), "curated-fs");
         assert_eq!(Arm::CuratedQ.name(), "curated-q");
         assert_eq!(Arm::CuratedCtx.name(), "curated-ctx");
+    }
+
+    #[test]
+    fn anchors_from_comparison_question() {
+        assert_eq!(
+            extract_anchors("Who had a longer film career, Harry Sweet or John Biddle?"),
+            vec!["Harry Sweet".to_string(), "John Biddle".to_string()]
+        );
+    }
+
+    #[test]
+    fn anchors_from_slash_entity() {
+        assert_eq!(
+            extract_anchors(
+                "What song was number 4 on the charts when a song from FutureSex/LoveSounds reached number 1?"
+            ),
+            vec!["FutureSex/LoveSounds".to_string()]
+        );
+    }
+
+    #[test]
+    fn anchors_from_quoted_span() {
+        assert_eq!(
+            extract_anchors("Which director adapted \"First Light\" for the screen?"),
+            vec!["First Light".to_string()]
+        );
+    }
+
+    #[test]
+    fn anchors_skip_overlong_all_caps_runs() {
+        assert_eq!(
+            extract_anchors(
+                "WHAT WAS THE NAME OF THE BOOK MADE INTO THE 2015 SOUTH KOREAN CRIME THRILLER, THE DEAL, DIRECTED BY SON YONG-HO?"
+            ),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
