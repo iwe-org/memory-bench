@@ -3,6 +3,7 @@ mod claude;
 mod clean;
 mod curate;
 mod doctor;
+mod hotpot;
 mod judge;
 mod locomo;
 mod metrics;
@@ -17,12 +18,15 @@ use std::process::Command as ProcessCommand;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use answer::{AnswerConfig, Arm, Split};
+use answer::{AnswerConfig, Arm, Dataset, Split};
 use curate::CurateConfig;
+use hotpot::IngestConfig;
 use judge::JudgeConfig;
 
 const LOCOMO_URL: &str =
     "https://raw.githubusercontent.com/snap-research/locomo/main/data/locomo10.json";
+const HOTPOT_URL: &str =
+    "http://web.archive.org/web/20260310132809id_/http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json";
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "IWE agent-memory benchmark harness")]
@@ -36,6 +40,20 @@ enum Command {
     Download {
         #[arg(long, default_value = "data")]
         data_dir: PathBuf,
+        #[arg(long, value_enum, default_value_t = Dataset::Locomo)]
+        dataset: Dataset,
+        #[arg(long)]
+        force: bool,
+    },
+    Ingest {
+        #[arg(long, default_value = "data/hotpot_dev_distractor_v1.json")]
+        data: PathBuf,
+        #[arg(long, default_value = "workspaces")]
+        workspaces: PathBuf,
+        #[arg(long, default_value_t = 50)]
+        dev_questions: usize,
+        #[arg(long, default_value_t = 300)]
+        test_questions: usize,
         #[arg(long)]
         force: bool,
     },
@@ -68,6 +86,8 @@ enum Command {
     Answer {
         #[arg(long)]
         run: PathBuf,
+        #[arg(long, value_enum, default_value_t = Dataset::Locomo)]
+        dataset: Dataset,
         #[arg(long, value_enum)]
         arm: Arm,
         #[arg(long, default_value = "claude-sonnet-4-6")]
@@ -136,15 +156,19 @@ fn parse_filter(text: &Option<String>) -> Option<BTreeSet<String>> {
     })
 }
 
-fn download(data_dir: &PathBuf, force: bool) -> Result<()> {
+fn download(data_dir: &PathBuf, dataset: Dataset, force: bool) -> Result<()> {
     std::fs::create_dir_all(data_dir)?;
-    let target = data_dir.join("locomo10.json");
+    let (url, filename) = match dataset {
+        Dataset::Locomo => (LOCOMO_URL, "locomo10.json"),
+        Dataset::Hotpot => (HOTPOT_URL, "hotpot_dev_distractor_v1.json"),
+    };
+    let target = data_dir.join(filename);
     if target.exists() && !force {
         println!("{} already exists", target.display());
         return Ok(());
     }
     let status = ProcessCommand::new("curl")
-        .args(["-sfL", LOCOMO_URL, "-o"])
+        .args(["-sfL", url, "-o"])
         .arg(&target)
         .status()?;
     anyhow::ensure!(status.success(), "download failed");
@@ -158,7 +182,24 @@ fn download(data_dir: &PathBuf, force: bool) -> Result<()> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Command::Download { data_dir, force } => download(&data_dir, force),
+        Command::Download {
+            data_dir,
+            dataset,
+            force,
+        } => download(&data_dir, dataset, force),
+        Command::Ingest {
+            data,
+            workspaces,
+            dev_questions,
+            test_questions,
+            force,
+        } => hotpot::ingest(&IngestConfig {
+            data,
+            workspaces,
+            dev_questions,
+            test_questions,
+            force,
+        }),
         Command::Prepare {
             data,
             workspaces,
@@ -185,6 +226,7 @@ fn main() -> Result<()> {
         }),
         Command::Answer {
             run,
+            dataset,
             arm,
             model,
             data,
@@ -199,6 +241,7 @@ fn main() -> Result<()> {
         } => {
             answer::run(&AnswerConfig {
                 run: run.clone(),
+                dataset,
                 arm,
                 model,
                 data,
@@ -207,6 +250,7 @@ fn main() -> Result<()> {
                 conversation_filter: split
                     .map(Split::conversations)
                     .or_else(|| parse_filter(&conversations)),
+                split,
                 limit,
                 workers,
                 max_budget_usd,

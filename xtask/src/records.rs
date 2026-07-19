@@ -2,13 +2,24 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn category_label<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::String(label) => Ok(label),
+        serde_json::Value::Number(number) => Ok(number.to_string()),
+        other => Err(serde::de::Error::custom(format!(
+            "unexpected category value: {other}"
+        ))),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnswerRecord {
     pub id: String,
     pub conversation: String,
-    pub category: u8,
+    #[serde(deserialize_with = "category_label")]
+    pub category: String,
     pub question: String,
     pub gold_answer: String,
     pub answer: String,
@@ -53,4 +64,27 @@ pub fn existing_ids(path: &Path) -> Result<BTreeSet<String>> {
             Ok(value["id"].as_str().unwrap_or_default().to_string())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_numeric_category() {
+        let record: AnswerRecord = serde_json::from_str(
+            r#"{"id":"a:1","conversation":"a","category":4,"question":"q","gold_answer":"g","answer":"x","total_cost_usd":0.0,"num_turns":1,"duration_ms":10,"session_id":null,"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#,
+        )
+        .unwrap();
+        assert_eq!(record.category, "4");
+    }
+
+    #[test]
+    fn reads_string_category() {
+        let record: AnswerRecord = serde_json::from_str(
+            r#"{"id":"q1","conversation":"hotpot","category":"bridge","question":"q","gold_answer":"g","answer":"x","total_cost_usd":0.0,"num_turns":1,"duration_ms":10,"session_id":null,"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}"#,
+        )
+        .unwrap();
+        assert_eq!(record.category, "bridge");
+    }
 }

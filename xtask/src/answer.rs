@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::claude::{self, Invocation};
+use crate::hotpot;
 use crate::locomo::{self, Conversation, Qa};
 use crate::prepare;
 use crate::records::{existing_ids, AnswerRecord};
@@ -15,6 +16,8 @@ use crate::records::{existing_ids, AnswerRecord};
 const ANSWER_TEMPLATE: &str = include_str!("../prompts/answer.md");
 const FULL_CONTEXT_TEMPLATE: &str = include_str!("../prompts/full_context.md");
 const CONTEXT_TEMPLATE: &str = include_str!("../prompts/answer_context.md");
+const HOTPOT_ANSWER_TEMPLATE: &str = include_str!("../prompts/answer_hotpot.md");
+const HOTPOT_CONTEXT_TEMPLATE: &str = include_str!("../prompts/answer_hotpot_context.md");
 
 pub const BASE_DISALLOWED: &[&str] = &[
     "Bash",
@@ -56,6 +59,21 @@ const IWE_QUERY_TOOLS: &[&str] = &["mcp__iwe__iwe_query"];
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
+pub enum Dataset {
+    Locomo,
+    Hotpot,
+}
+
+impl Dataset {
+    pub fn name(self) -> &'static str {
+        match self {
+            Dataset::Locomo => "locomo",
+            Dataset::Hotpot => "hotpot",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum Arm {
     Fs,
     Iwe,
@@ -65,6 +83,7 @@ pub enum Arm {
     CuratedFs,
     CuratedQ,
     CuratedCtx,
+    Ctx,
 }
 
 impl Arm {
@@ -78,6 +97,7 @@ impl Arm {
             Arm::CuratedFs => "curated-fs",
             Arm::CuratedQ => "curated-q",
             Arm::CuratedCtx => "curated-ctx",
+            Arm::Ctx => "ctx",
         }
     }
 
@@ -86,7 +106,7 @@ impl Arm {
             Arm::Fs => Some("fs"),
             Arm::Iwe | Arm::FsIwe => Some("iwe"),
             Arm::Curated | Arm::CuratedFs | Arm::CuratedQ | Arm::CuratedCtx => Some("curated"),
-            Arm::FullContext => None,
+            Arm::FullContext | Arm::Ctx => None,
         }
     }
 
@@ -97,7 +117,7 @@ impl Arm {
             Arm::FsIwe => [FILE_TOOLS, IWE_READ_TOOLS].concat(),
             Arm::FullContext => Vec::new(),
             Arm::CuratedQ => [IWE_READ_TOOLS, IWE_QUERY_TOOLS].concat(),
-            Arm::CuratedCtx => Vec::new(),
+            Arm::CuratedCtx | Arm::Ctx => Vec::new(),
         }
     }
 
@@ -113,7 +133,7 @@ impl Arm {
                 [BASE_DISALLOWED, IWE_READ_TOOLS, IWE_WRITE_TOOLS, IWE_QUERY_TOOLS].concat()
             }
             Arm::CuratedQ => [BASE_DISALLOWED, FILE_TOOLS, IWE_WRITE_TOOLS].concat(),
-            Arm::CuratedCtx => [
+            Arm::CuratedCtx | Arm::Ctx => [
                 BASE_DISALLOWED,
                 FILE_TOOLS,
                 IWE_READ_TOOLS,
@@ -136,6 +156,13 @@ pub enum Split {
 }
 
 impl Split {
+    pub fn name(self) -> &'static str {
+        match self {
+            Split::Dev => "dev",
+            Split::Test => "test",
+        }
+    }
+
     pub fn conversations(self) -> BTreeSet<String> {
         let ids: &[&str] = match self {
             Split::Dev => &["conv-26", "conv-30"],
@@ -150,12 +177,14 @@ impl Split {
 
 pub struct AnswerConfig {
     pub run: PathBuf,
+    pub dataset: Dataset,
     pub arm: Arm,
     pub model: String,
     pub data: PathBuf,
     pub workspaces: PathBuf,
     pub categories: BTreeSet<u8>,
     pub conversation_filter: Option<BTreeSet<String>>,
+    pub split: Option<Split>,
     pub limit: Option<usize>,
     pub workers: usize,
     pub max_budget_usd: f64,
@@ -244,9 +273,12 @@ fn write_meta(config: &AnswerConfig) -> Result<()> {
     if meta_path.exists() {
         let existing: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+        let existing_dataset = existing["dataset"].as_str().unwrap_or("locomo");
         anyhow::ensure!(
-            existing["arm"] == config.arm.name() && existing["model"] == config.model.as_str(),
-            "run dir {} was started with arm={} model={}; use a fresh --run dir",
+            existing["arm"] == config.arm.name()
+                && existing["model"] == config.model.as_str()
+                && existing_dataset == config.dataset.name(),
+            "run dir {} was started with dataset={existing_dataset} arm={} model={}; use a fresh --run dir",
             config.run.display(),
             existing["arm"],
             existing["model"],
@@ -254,6 +286,7 @@ fn write_meta(config: &AnswerConfig) -> Result<()> {
         return Ok(());
     }
     let meta = serde_json::json!({
+        "dataset": config.dataset.name(),
         "arm": config.arm.name(),
         "model": config.model,
         "categories": config.categories,
@@ -300,7 +333,7 @@ fn answer_one(
     Ok(AnswerRecord {
         id: format!("{}:{index}", conversation.sample_id),
         conversation: conversation.sample_id.clone(),
-        category: qa.category,
+        category: qa.category.to_string(),
         question: qa.question.clone(),
         gold_answer: qa.answer.clone(),
         answer: answer.trim().to_string(),
@@ -316,6 +349,159 @@ fn answer_one(
 }
 
 pub fn run(config: &AnswerConfig) -> Result<()> {
+    match config.dataset {
+        Dataset::Locomo => {
+            anyhow::ensure!(
+                config.arm != Arm::Ctx,
+                "arm ctx is hotpot-only; use curated-ctx for locomo"
+            );
+            run_locomo(config)
+        }
+        Dataset::Hotpot => {
+            anyhow::ensure!(
+                matches!(config.arm, Arm::Ctx | Arm::Fs),
+                "dataset hotpot supports arms ctx and fs"
+            );
+            run_hotpot(config)
+        }
+    }
+}
+
+fn hotpot_prompt(config: &AnswerConfig, corpus: &Path, question: &hotpot::Question) -> Result<String> {
+    let template = match config.arm {
+        Arm::Ctx => HOTPOT_CONTEXT_TEMPLATE
+            .replace("{context}", &render_dossier(corpus, &question.question)?),
+        _ => HOTPOT_ANSWER_TEMPLATE.to_string(),
+    };
+    Ok(template.replace("{question}", &question.question))
+}
+
+fn answer_hotpot_one(
+    config: &AnswerConfig,
+    corpus: &Path,
+    question: &hotpot::Question,
+) -> Result<AnswerRecord> {
+    let prompt = hotpot_prompt(config, corpus, question)?;
+    let allowed = config.arm.allowed_tools();
+    let disallowed = config.arm.disallowed_tools();
+    let result = claude::run(&Invocation {
+        cwd: corpus,
+        prompt: &prompt,
+        model: &config.model,
+        allowed_tools: &allowed,
+        disallowed_tools: &disallowed,
+        mcp_config: None,
+        max_budget_usd: config.max_budget_usd,
+        timeout: Duration::from_secs(config.timeout_secs),
+    })?;
+    let answer = result.result.clone().unwrap_or_default();
+    anyhow::ensure!(
+        !result.is_error,
+        "claude returned an error ({}): {}",
+        result.subtype,
+        answer.chars().take(200).collect::<String>()
+    );
+    Ok(AnswerRecord {
+        id: question.id.clone(),
+        conversation: "hotpot".to_string(),
+        category: question.qtype.clone(),
+        question: question.question.clone(),
+        gold_answer: question.answer.clone(),
+        answer: answer.trim().to_string(),
+        total_cost_usd: result.total_cost_usd,
+        num_turns: result.num_turns,
+        duration_ms: result.duration_ms,
+        session_id: result.session_id,
+        input_tokens: result.usage.input_tokens,
+        output_tokens: result.usage.output_tokens,
+        cache_creation_input_tokens: result.usage.cache_creation_input_tokens,
+        cache_read_input_tokens: result.usage.cache_read_input_tokens,
+    })
+}
+
+fn run_hotpot(config: &AnswerConfig) -> Result<()> {
+    std::fs::create_dir_all(&config.run)?;
+    write_meta(config)?;
+    let answers_path = config.run.join("answers.jsonl");
+    let done = existing_ids(&answers_path)?;
+    let writer = Mutex::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&answers_path)?,
+    );
+    let root = config.workspaces.join("hotpot");
+    let corpus = root.join("corpus");
+    anyhow::ensure!(
+        corpus.exists(),
+        "corpus {} missing; run `cargo xtask ingest` first",
+        corpus.display()
+    );
+    let split = config.split.unwrap_or(Split::Dev);
+    let questions_file = match split {
+        Split::Dev => "questions-dev.json",
+        Split::Test => "questions-test.json",
+    };
+    let questions = hotpot::read_questions(&root.join(questions_file))?;
+    let questions_slice = match config.limit {
+        Some(limit) => &questions[..limit.min(questions.len())],
+        None => &questions[..],
+    };
+    let mut pending: VecDeque<&hotpot::Question> = questions_slice
+        .iter()
+        .filter(|q| !done.contains(&q.id))
+        .collect();
+    if pending.is_empty() {
+        println!("hotpot {}: already complete", split.name());
+        return Ok(());
+    }
+    let total = pending.len();
+    let failures = AtomicUsize::new(0);
+    let completed = AtomicUsize::new(0);
+    let process = |question: &hotpot::Question| {
+        match answer_hotpot_one(config, &corpus, question) {
+            Ok(record) => {
+                failures.store(0, Ordering::SeqCst);
+                completed.fetch_add(1, Ordering::SeqCst);
+                let line = serde_json::to_string(&record).expect("serialize record");
+                let mut file = writer.lock().expect("writer lock");
+                writeln!(file, "{line}").expect("append answer");
+            }
+            Err(error) => {
+                failures.fetch_add(1, Ordering::SeqCst);
+                eprintln!("{} failed: {error:#}", question.id);
+            }
+        }
+    };
+    if let Some(question) = pending.pop_front() {
+        process(question);
+    }
+    let queue = Mutex::new(pending);
+    std::thread::scope(|scope| {
+        for _ in 0..config.workers.max(1) {
+            scope.spawn(|| loop {
+                if failures.load(Ordering::SeqCst) >= MAX_CONSECUTIVE_FAILURES {
+                    break;
+                }
+                let item = queue.lock().expect("queue lock").pop_front();
+                let Some(question) = item else { break };
+                process(question);
+            });
+        }
+    });
+    anyhow::ensure!(
+        failures.load(Ordering::SeqCst) < MAX_CONSECUTIVE_FAILURES,
+        "aborted after {MAX_CONSECUTIVE_FAILURES} consecutive failures (usage limit?); rerun the same command to resume"
+    );
+    println!(
+        "hotpot {}: answered {}/{total} questions",
+        split.name(),
+        completed.load(Ordering::SeqCst)
+    );
+    Ok(())
+}
+
+fn run_locomo(config: &AnswerConfig) -> Result<()> {
     std::fs::create_dir_all(&config.run)?;
     write_meta(config)?;
     let answers_path = config.run.join("answers.jsonl");

@@ -12,7 +12,20 @@ use crate::claude::{self, Invocation};
 use crate::records::{existing_ids, read_jsonl, AnswerRecord, JudgmentRecord};
 
 const JUDGE_TEMPLATE: &str = include_str!("../prompts/judge.md");
+const JUDGE_HOTPOT_TEMPLATE: &str = include_str!("../prompts/judge_hotpot.md");
 const MAX_CONSECUTIVE_FAILURES: usize = 5;
+
+fn judge_template(run: &Path) -> Result<&'static str> {
+    let meta_path = run.join("meta.json");
+    if !meta_path.exists() {
+        return Ok(JUDGE_TEMPLATE);
+    }
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&meta_path)?)?;
+    Ok(match meta["dataset"].as_str() {
+        Some("hotpot") => JUDGE_HOTPOT_TEMPLATE,
+        _ => JUDGE_TEMPLATE,
+    })
+}
 
 pub fn extract_verdict(text: &str) -> Result<(String, String)> {
     let start = text.find('{').context("no JSON object in judge output")?;
@@ -38,8 +51,13 @@ pub struct JudgeConfig {
     pub timeout_secs: u64,
 }
 
-fn judge_one(config: &JudgeConfig, cwd: &Path, answer: &AnswerRecord) -> Result<JudgmentRecord> {
-    let prompt = JUDGE_TEMPLATE
+fn judge_one(
+    config: &JudgeConfig,
+    template: &str,
+    cwd: &Path,
+    answer: &AnswerRecord,
+) -> Result<JudgmentRecord> {
+    let prompt = template
         .replace("{question}", &answer.question)
         .replace("{gold_answer}", &answer.gold_answer)
         .replace("{generated_answer}", &answer.answer);
@@ -71,6 +89,7 @@ fn judge_one(config: &JudgeConfig, cwd: &Path, answer: &AnswerRecord) -> Result<
 }
 
 pub fn run(config: &JudgeConfig) -> Result<()> {
+    let template = judge_template(&config.run)?;
     let answers: Vec<AnswerRecord> = read_jsonl(&config.run.join("answers.jsonl"))?;
     let judgments_path = config.run.join("judgments.jsonl");
     let done = existing_ids(&judgments_path)?;
@@ -98,7 +117,7 @@ pub fn run(config: &JudgeConfig) -> Result<()> {
                 }
                 let item = queue.lock().expect("queue lock").pop_front();
                 let Some(answer) = item else { break };
-                match judge_one(config, &cwd, answer) {
+                match judge_one(config, template, &cwd, answer) {
                     Ok(record) => {
                         failures.store(0, Ordering::SeqCst);
                         completed.fetch_add(1, Ordering::SeqCst);

@@ -26,7 +26,8 @@ shape.
   one-shot arm, `full_context.md`, `judge.md`) and are compiled in — see Setup.
 - `docs/store-form.md` — normative store shape (when a curation prompt and this
   document disagree, the document wins); `docs/store-schemas/` — hub and session
-  page schemas; `docs/test-plan.md` — test-set protocol.
+  page schemas; `docs/test-plan.md` — test-set protocol; `docs/hotpot.md` —
+  HotPotQA track protocol.
 - `results/` — one directory per run (JSONL records, `meta.json`, `summary.json`),
   plus `RUNS.md` and `curated-pilot-report.md`.
 - `bin-pinned/` — frozen `iwe`/`iwec` builds for the test set.
@@ -219,6 +220,29 @@ efficiency metrics.
 Full test set (8 conversations, ~1,400 questions, 3 `curated-ctx` repetitions +
 1 `fs` baseline + judges): ~$350, an afternoon of wall clock — the breakdown is in
 `docs/test-plan.md`.
+
+## HotPotQA track
+
+A second track measures IWE as a retrieval substrate for multi-hop factoid QA
+over a document corpus — no curation stage, mechanical ingestion, same isolation
+and judge machinery. `docs/hotpot.md` is the protocol of record.
+
+```bash
+X=target/debug/xtask
+$X download --dataset hotpot
+$X ingest
+$X answer --run results/hotpot-dev-ctx --dataset hotpot --arm ctx --split dev --workers 6 --max-budget-usd 2
+$X answer --run results/hotpot-dev-fs --dataset hotpot --arm fs --split dev --workers 6 --max-budget-usd 2
+$X judge --run results/hotpot-dev-ctx --workers 6
+$X judge --run results/hotpot-dev-fs --workers 6
+```
+
+`ingest` freezes a deterministic question sample (50 dev + 300 test) into
+`workspaces/hotpot/` and builds one shared corpus store (one markdown page per
+Wikipedia article, ~3,500 pages); it refuses to re-sample without `--force`.
+The `ctx` arm answers one-shot over a harness-assembled `iwe retrieve` dossier;
+`fs` is the agentic grep baseline over the same files. `judge` picks the
+HotPotQA judge prompt automatically from the run's `meta.json`.
 
 ## Isolation: how it works
 

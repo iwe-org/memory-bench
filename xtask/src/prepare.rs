@@ -86,7 +86,7 @@ match = "[0-9]*"
 match = "[a-z]*"
 "#;
 
-pub fn init_iwe(dir: &Path) -> Result<()> {
+pub fn init_iwe_bare(dir: &Path) -> Result<()> {
     if dir.join(".iwe").exists() {
         return Ok(());
     }
@@ -97,6 +97,14 @@ pub fn init_iwe(dir: &Path) -> Result<()> {
         .status()
         .with_context(|| format!("failed to run {iwe_bin} init"))?;
     anyhow::ensure!(status.success(), "iwe init failed in {}", dir.display());
+    Ok(())
+}
+
+pub fn init_iwe(dir: &Path) -> Result<()> {
+    if dir.join(".iwe").exists() {
+        return Ok(());
+    }
+    init_iwe_bare(dir)?;
     let schemas_dir = dir.join(".iwe").join("schemas");
     std::fs::create_dir_all(&schemas_dir)?;
     std::fs::write(schemas_dir.join("session.yaml"), SESSION_SCHEMA)?;

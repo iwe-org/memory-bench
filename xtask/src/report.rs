@@ -81,7 +81,7 @@ pub fn build(run: &Path) -> Result<Value> {
         .collect();
     let all: Vec<&Row> = rows.iter().collect();
     let mut categories = serde_json::Map::new();
-    let mut category_ids: Vec<u8> = rows.iter().map(|r| r.answer.category).collect();
+    let mut category_ids: Vec<String> = rows.iter().map(|r| r.answer.category.clone()).collect();
     category_ids.sort_unstable();
     category_ids.dedup();
     for category in category_ids {
@@ -89,7 +89,7 @@ pub fn build(run: &Path) -> Result<Value> {
             .iter()
             .filter(|r| r.answer.category == category)
             .collect();
-        categories.insert(category.to_string(), aggregate(&subset));
+        categories.insert(category, aggregate(&subset));
     }
     let meta_path = run.join("meta.json");
     let meta: Value = if meta_path.exists() {
@@ -119,7 +119,7 @@ fn cell(value: &Value) -> String {
 
 pub fn print(summary: &Value) {
     println!(
-        "{:<12}{:>6}{:>8}{:>8}{:>8}{:>9}{:>8}{:>9}{:>9}",
+        "{:<21}{:>6}{:>8}{:>8}{:>8}{:>9}{:>8}{:>9}{:>9}",
         "scope", "n", "J", "F1", "BLEU-1", "cost$", "turns", "p50 s", "p95 s"
     );
     let mut scopes = vec![("overall".to_string(), &summary["overall"])];
@@ -130,7 +130,7 @@ pub fn print(summary: &Value) {
     }
     for (name, s) in scopes {
         println!(
-            "{:<12}{:>6}{:>8}{:>8}{:>8}{:>9}{:>8}{:>9}{:>9}",
+            "{:<21}{:>6}{:>8}{:>8}{:>8}{:>9}{:>8}{:>9}{:>9}",
             name,
             cell(&s["questions"]),
             cell(&s["j"]),
